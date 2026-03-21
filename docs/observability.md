@@ -7,7 +7,7 @@ relay は logging, metrics (hooks 経由), tracing を v1 の必須機能とし�
 `log/slog` ベースの構造化ログ。
 
 ```go
-rt := relay.New(client, cfg, relay.WithLogger(
+rt := relay.New[T](client, cfg, handler, relay.WithLogger(
     slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
         Level: slog.LevelDebug,
     })),
@@ -28,16 +28,14 @@ rt := relay.New(client, cfg, relay.WithLogger(
 | `relay: handler success` | INFO | handler が nil を返した時 |
 | `relay: handler retry` | WARN | handler が retry を返した時 |
 | `relay: handler discard` | WARN | handler が discard を返した時 |
-| `relay: envelope decode failure` | ERROR | JSON decode 失敗 |
-| `relay: envelope missing type field` | ERROR | type フィールドなし |
-| `relay: unknown message type` | ERROR | 未登録 type |
+| `relay: message decode failure` | ERROR | decoder 失敗 |
 | `relay: panic recovered` | ERROR | handler panic |
 | `relay: receive error` | ERROR | SQS ReceiveMessage 失敗 |
 | `relay: delete message failed` | ERROR | SQS DeleteMessage 失敗 |
 | `relay: lease extension failed` | ERROR | ChangeMessageVisibility 失敗 |
 | `relay: max processing time exceeded` | WARN | 延長上限到達 |
 
-共通フィールド: `message_id`, `message_type`, `error` (該当時)
+共通フィールド: `message_id`, `error` (該当時)
 
 ## Tracing
 
@@ -50,7 +48,7 @@ tp := sdktrace.NewTracerProvider(
     sdktrace.WithBatcher(exporter),
     sdktrace.WithResource(resource),
 )
-rt := relay.New(client, cfg, relay.WithTracerProvider(tp))
+rt := relay.New[T](client, cfg, handler, relay.WithTracerProvider(tp))
 ```
 
 省略時は `otel.GetTracerProvider()`。
@@ -73,7 +71,6 @@ OTel SDK 未初期化の場合は noop tracer が使われ、オーバーヘッ�
 | `messaging.destination` | string | queue URL |
 | `messaging.message.id` | string | SQS MessageId |
 | `messaging.operation` | string | `process` |
-| `relay.message.type` | string | `send_email` |
 | `relay.attempt` | int | `1` |
 | `relay.result` | string | `retry` / `discard` (失敗時のみ) |
 
@@ -106,18 +103,17 @@ v1 の runtime 本体には Prometheus registry 等への直接依存はない�
 | メトリクス名 | 型 | ラベル |
 |---|---|---|
 | `relay_messages_received_total` | counter | `queue` |
-| `relay_messages_processed_total` | counter | `queue`, `message_type`, `result` |
-| `relay_messages_succeeded_total` | counter | `queue`, `message_type` |
-| `relay_messages_retried_total` | counter | `queue`, `message_type` |
-| `relay_messages_discarded_total` | counter | `queue`, `message_type` |
+| `relay_messages_processed_total` | counter | `queue`, `result` |
+| `relay_messages_succeeded_total` | counter | `queue` |
+| `relay_messages_retried_total` | counter | `queue` |
+| `relay_messages_discarded_total` | counter | `queue` |
 | `relay_messages_decode_failed_total` | counter | `queue` |
-| `relay_messages_unknown_type_total` | counter | `queue` |
-| `relay_handler_duration_seconds` | histogram | `queue`, `message_type`, `result` |
+| `relay_handler_duration_seconds` | histogram | `queue`, `result` |
 | `relay_inflight_messages` | gauge | `queue` |
 | `relay_receive_errors_total` | counter | `queue` |
 | `relay_visibility_extensions_total` | counter | `queue` |
 | `relay_visibility_extension_errors_total` | counter | `queue` |
-| `relay_handler_panics_total` | counter | `queue`, `message_type` |
+| `relay_handler_panics_total` | counter | `queue` |
 
 ### Hook を使ったメトリクス実装例
 
@@ -125,12 +121,12 @@ v1 の runtime 本体には Prometheus registry 等への直接依存はない�
 func newMetricsHooks(reg prometheus.Registerer) relay.Hooks {
     processed := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
         Name: "relay_messages_processed_total",
-    }, []string{"message_type", "result"})
+    }, []string{"result"})
 
     duration := promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
         Name:    "relay_handler_duration_seconds",
         Buckets: prometheus.DefBuckets,
-    }, []string{"message_type"})
+    }, []string{"result"})
 
     starts := map[string]time.Time{}
     var mu sync.Mutex
@@ -151,11 +147,11 @@ func newMetricsHooks(reg prometheus.Registerer) relay.Hooks {
             default:
                 result = "retry"
             }
-            processed.WithLabelValues(info.Type, result).Inc()
+            processed.WithLabelValues(result).Inc()
 
             mu.Lock()
             if start, ok := starts[info.ID]; ok {
-                duration.WithLabelValues(info.Type).Observe(time.Since(start).Seconds())
+                duration.WithLabelValues(result).Observe(time.Since(start).Seconds())
                 delete(starts, info.ID)
             }
             mu.Unlock()

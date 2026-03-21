@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -269,6 +270,43 @@ func TestDecodeFailureIsDiscarded(t *testing.T) {
 	defer mock.mu.Unlock()
 	if len(mock.deleted) != 1 {
 		t.Errorf("decode failure should be discarded (deleted), deleted = %v", mock.deleted)
+	}
+}
+
+func TestWithDecoder(t *testing.T) {
+	type P struct{ Value string }
+
+	mock := &mockSQSClient{
+		messages: []sqstypes.Message{
+			{
+				MessageId:     ptr("msg-1"),
+				ReceiptHandle: ptr("rh-1"),
+				Body:          ptr("custom:hello"),
+				Attributes:    map[string]string{"ApproximateReceiveCount": "1"},
+			},
+		},
+	}
+
+	var called atomic.Bool
+	rt := New[P](mock, Config{
+		QueueURL:    "https://sqs.example.com/test",
+		Concurrency: 1,
+	}, func(ctx context.Context, msg Message[P]) error {
+		if msg.Payload.Value != "hello" {
+			t.Errorf("Value = %q, want hello", msg.Payload.Value)
+		}
+		called.Store(true)
+		return nil
+	}, WithDecoder(func(body string) (P, error) {
+		return P{Value: strings.TrimPrefix(body, "custom:")}, nil
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_ = rt.Run(ctx)
+
+	if !called.Load() {
+		t.Error("handler was not called")
 	}
 }
 

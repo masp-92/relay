@@ -12,10 +12,7 @@ Producer ─── SendMessage ───▶ SQS Queue
                           │  poll loop   │──── ReceiveMessage (long poll)
                           │      │       │
                           │      ▼       │
-                          │  decode      │──── JSON → Envelope
-                          │      │       │
-                          │      ▼       │
-                          │  dispatch    │──── type → handler lookup
+                          │   decode     │──── decoder(body) → T
                           │      │       │
                           │   ┌──┴──┐    │
                           │   │ sem │    │──── concurrency control
@@ -24,7 +21,7 @@ Producer ─── SendMessage ───▶ SQS Queue
                           │  handler()   │──── goroutine per message
                           │      │       │
                           │      ▼       │
-                          │  outcome     │──── nil/Retry/Discard → delete or leave
+                          │   outcome    │──── nil/Retry/Discard → delete or leave
                           └──────────────┘
 ```
 
@@ -36,27 +33,27 @@ Producer ─── SendMessage ───▶ SQS Queue
 
 - **Poll Loop**: SQS long polling で継続的にメッセージを受信。receive エラー時は指数 backoff。
 - **Semaphore**: `chan struct{}` で concurrency を制御。`Config.Concurrency` 数ぶんの goroutine のみ並行実行。
-- **Dispatcher**: `Envelope.Type` をキーに `map[string]handlerEntry` から handler を検索。
+- **Decoder**: `decoder(body) → T` で SQS Body を payload 型にデコード。デフォルトは JSON、`WithDecoder` で差し替え可能。
 - **Lease Extender**: 処理中メッセージの visibility timeout を定期延長する goroutine。handler 完了時に cancel。
 - **In-flight Tracker**: `sync.Mutex` + `map` で処理中メッセージを管理。shutdown の drain に利用。
 - **Shutdown**: `ctx` cancel → polling 停止 → `sync.WaitGroup` で in-flight 完了待ち → timeout で打ち切り。
 
-### Handler Registry
+### Handler
 
 ```
-Handle[T any](rt, messageType, fn)
+New[T any](client, cfg, fn, opts...)
     ↓
-handlerEntry{
-    fn: func(ctx, msgID, *Envelope, Metadata) error  ← type-erased
+Runtime[T]{
+    handler: fn,
+    decoder: Decoder[T],   ← デフォルト JSON、WithDecoder で差し替え
 }
-    ↓ (内部で)
-json.Unmarshal(env.Payload, &T{})
+    ↓ processMessage
+decoder(body) → T
     ↓
 fn(ctx, Message[T]{...})
 ```
 
-Go がジェネリックメソッドを持たないため、`Handle` はパッケージレベル関数。
-内部的には `json.RawMessage` → 具象型 T への unmarshal を type erasure で包んでいる。
+1 queue = 1 handler。`Runtime[T]` は型パラメータ T を持つ。
 
 ### Error Flow
 
@@ -107,22 +104,21 @@ handler goroutine         lease goroutine
 ```
 relay/
 ├── doc.go           パッケージドキュメント
-├── runtime.go       Runtime struct, New, Run, pollLoop, processMessage
+├── runtime.go       Runtime[T], New, Run, pollLoop, processMessage
 ├── config.go        Config, setDefaults, validate
-├── message.go       Message[T], Metadata, Envelope, MessageInfo, RawMessage
+├── message.go       Message[T], Metadata, MessageInfo, RawMessage
 ├── error.go         Retry, Discard, IsRetry, IsDiscard
 ├── handler.go       HandlerFunc[T] 型定義
 ├── hooks.go         Hooks struct
-├── option.go        Option, WithHooks, WithLogger, WithTracerProvider
+├── option.go        Option, Decoder[T], WithDecoder, WithHooks, WithLogger, WithTracerProvider
 ├── sqs_client.go    SQSClient interface
 └── internal/        (将来の切り出し先)
-    ├── dispatcher/
     ├── lease/
     ├── polling/
     └── decode/
 ```
 
-現状 `runtime.go` (~480 行) に主要ロジックが集約されている。
+現状 `runtime.go` に主要ロジックが集約されている。
 ファイルが肥大化した場合、internal 以下に切り出す。
 公開 API は root パッケージに残し、internal は実装詳細とする。
 

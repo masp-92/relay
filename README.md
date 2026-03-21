@@ -7,7 +7,7 @@ SQS 上で typed message handler を安全に実行する、Go らしい薄い w
 SQS worker を書くたびに同じボイラープレートを書いていませんか?
 
 - long polling ループ
-- JSON decode → dispatch
+- JSON decode
 - retry / discard の判定
 - visibility timeout の延長
 - graceful shutdown
@@ -47,12 +47,10 @@ func main() {
     cfg, _ := config.LoadDefaultConfig(ctx)
     sqsClient := sqs.NewFromConfig(cfg)
 
-    rt := relay.New(sqsClient, relay.Config{
+    rt := relay.New[SendEmail](sqsClient, relay.Config{
         QueueURL:    "https://sqs.ap-northeast-1.amazonaws.com/123456789012/my-queue",
         Concurrency: 8,
-    })
-
-    relay.Handle(rt, "send_email", func(ctx context.Context, msg relay.Message[SendEmail]) error {
+    }, func(ctx context.Context, msg relay.Message[SendEmail]) error {
         if err := sendEmail(ctx, msg.Payload.UserID, msg.Payload.Kind); err != nil {
             if errors.Is(err, errInvalidUser) {
                 return relay.Discard(err) // 永続的な失敗 → 削除
@@ -70,28 +68,16 @@ func main() {
 
 ## メッセージフォーマット
 
-SQS の Body に以下の JSON envelope を期待します。
+SQS の Body に payload を **直接** JSON として格納します。
 
 ```json
 {
-  "type": "send_email",
-  "payload": {
-    "user_id": 123,
-    "kind": "welcome"
-  },
-  "meta": {
-    "correlation_id": "req-abc-123",
-    "enqueued_at": "2026-03-21T10:00:00Z"
-  }
+  "user_id": 123,
+  "kind": "welcome"
 }
 ```
 
-| フィールド | 必須 | 説明 |
-|---|---|---|
-| `type` | ✅ | handler dispatch に使う文字列キー |
-| `payload` | ✅ | handler の型パラメータ `T` にデコードされる |
-| `meta.correlation_id` | — | トレース用の相関 ID |
-| `meta.enqueued_at` | — | エンキュー時刻 |
+envelope ラッパーは不要です。relay は「1 queue = 1 job type」を前提としており、type による dispatch は行いません。
 
 ## Handler の戻り値
 
@@ -126,13 +112,29 @@ relay.Config{
 Go の generics を使い、payload を型安全にデコードします。
 
 ```go
-relay.Handle(rt, "sync_inventory", func(ctx context.Context, msg relay.Message[SyncInventory]) error {
+rt := relay.New[SyncInventory](sqsClient, cfg, func(ctx context.Context, msg relay.Message[SyncInventory]) error {
     // msg.Payload は SyncInventory 型
     return inventoryService.Sync(ctx, msg.Payload.ProductID)
 })
 ```
 
-> **Note:** Go はジェネリックメソッドをサポートしないため、`Handle` はパッケージレベル関数です。
+### カスタム Decoder
+
+デフォルトは JSON。`WithDecoder` で差し替え可能です。
+
+```go
+// protobuf + base64
+rt := relay.New[*pb.SendEmail](sqsClient, cfg, handler,
+    relay.WithDecoder(func(body string) (*pb.SendEmail, error) {
+        b, err := base64.StdEncoding.DecodeString(body)
+        if err != nil {
+            return nil, err
+        }
+        msg := &pb.SendEmail{}
+        return msg, proto.Unmarshal(b, msg)
+    }),
+)
+```
 
 ### Visibility Timeout 延長 (Lease Extension)
 
@@ -171,7 +173,7 @@ handler 内の panic は runtime が recover し、リトライ扱いにしま�
 ライフサイクルイベントに hook を差し込めます。
 
 ```go
-rt := relay.New(client, cfg, relay.WithHooks(relay.Hooks{
+rt := relay.New[T](client, cfg, handler, relay.WithHooks(relay.Hooks{
     OnReceive:         func(ctx context.Context, msg relay.RawMessage) { /* ... */ },
     OnHandlerStart:    func(ctx context.Context, info relay.MessageInfo) { /* ... */ },
     OnHandlerFinish:   func(ctx context.Context, info relay.MessageInfo, err error) { /* ... */ },
@@ -189,12 +191,11 @@ rt := relay.New(client, cfg, relay.WithHooks(relay.Hooks{
 | `messaging.system` | `sqs` |
 | `messaging.destination` | queue URL |
 | `messaging.message.id` | SQS MessageId |
-| `relay.message.type` | `send_email` |
 | `relay.attempt` | `1` |
 | `relay.result` | `retry` / `discard` |
 
 ```go
-rt := relay.New(client, cfg, relay.WithTracerProvider(tp))
+rt := relay.New[T](client, cfg, handler, relay.WithTracerProvider(tp))
 ```
 
 ### 構造化ログ
@@ -202,16 +203,14 @@ rt := relay.New(client, cfg, relay.WithTracerProvider(tp))
 `log/slog` ベース。カスタムロガーを渡せます。
 
 ```go
-rt := relay.New(client, cfg, relay.WithLogger(slog.New(handler)))
+rt := relay.New[T](client, cfg, handler, relay.WithLogger(slog.New(handler)))
 ```
 
 ## エッジケースの処理
 
 | ケース | 動作 |
 |---|---|
-| JSON decode 失敗 | 削除（discard） + エラーログ |
-| `type` フィールドなし | 削除（discard） + エラーログ |
-| 未登録の message type | 削除（discard） + エラーログ |
+| decode 失敗 | 削除（discard） + エラーログ |
 | handler panic | recover → リトライ扱い |
 | SQS receive エラー | 指数 backoff (上限 30s) → polling 継続 |
 | SQS delete エラー | エラーログ → runtime 継続（重複配信の可能性あり） |
@@ -222,11 +221,11 @@ rt := relay.New(client, cfg, relay.WithLogger(slog.New(handler)))
 | 判断 | 理由 |
 |---|---|
 | SQS 専用、multi-broker 抽象なし | v1 は specific-driven。使わない抽象化は作らない |
+| 1 queue = 1 job type | SQS は visibility timeout, DLQ, メトリクスがキュー単位。運用上の自然な形 |
 | at-least-once 前提 | SQS の delivery semantics。handler は idempotent に |
 | plain error = retry | transient failure が最も多いケース。最短コードで書ける |
-| 未登録 type = discard | retry し続けると poison message 化するため |
+| Decoder を差し替え可能 | protobuf + base64 等、JSON 以外のフォーマットに対応 |
 | handler kill なし | goroutine の強制停止は Go にはない。延長停止のみ |
-| `Handle` がパッケージ関数 | Go がジェネリックメソッドをサポートしない制約 |
 
 ## Non-Goals
 

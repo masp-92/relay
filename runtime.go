@@ -8,6 +8,7 @@ import (
 	"math"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -28,6 +29,8 @@ type Runtime[T any] struct {
 	config  Config
 	opts    options
 	handler HandlerFunc[T]
+	decoder Decoder[T]
+	sealed  atomic.Bool
 
 	// in-flight tracking
 	mu       sync.Mutex
@@ -61,11 +64,22 @@ func New[T any](client SQSClient, cfg Config, handler HandlerFunc[T], opts ...Op
 		o.tracerProvider = otel.GetTracerProvider()
 	}
 
+	var decoder Decoder[T]
+	if o.decoder != nil {
+		decoder = o.decoder.(Decoder[T])
+	} else {
+		decoder = func(body string) (T, error) {
+			var v T
+			return v, json.Unmarshal([]byte(body), &v)
+		}
+	}
+
 	return &Runtime[T]{
 		client:   client,
 		config:   cfg,
 		opts:     o,
 		handler:  handler,
+		decoder:  decoder,
 		inflight: make(map[string]*inflightMsg),
 		sem:      make(chan struct{}, cfg.Concurrency),
 		logger:   o.logger.With("component", "relay"),
@@ -75,7 +89,11 @@ func New[T any](client SQSClient, cfg Config, handler HandlerFunc[T], opts ...Op
 
 // Run starts the polling loop and blocks until ctx is cancelled or a fatal error occurs.
 // After ctx cancellation, it performs graceful shutdown.
+// Run must be called at most once per Runtime.
 func (rt *Runtime[T]) Run(ctx context.Context) error {
+	if rt.sealed.Swap(true) {
+		return fmt.Errorf("relay: Run called more than once")
+	}
 	if err := rt.config.validate(); err != nil {
 		return err
 	}
@@ -191,9 +209,9 @@ func (rt *Runtime[T]) processMessage(ctx context.Context, sqsMsg sqstypes.Messag
 
 	rt.logger.DebugContext(ctx, "relay: message received", "message_id", msgID)
 
-	// Decode body directly into T
-	var payload T
-	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+	// Decode body into T using the configured decoder
+	payload, err := rt.decoder(body)
+	if err != nil {
 		rt.logger.ErrorContext(ctx, "relay: message decode failure",
 			"message_id", msgID,
 			"error", err,
