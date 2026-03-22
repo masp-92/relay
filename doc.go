@@ -1,17 +1,15 @@
 // Package relay is a thin worker runtime for Amazon SQS.
 //
 // relay standardizes the common concerns of SQS-based background job processing:
-// long polling, message decoding, handler dispatch, retry/discard control,
+// long polling, message decoding, retry/discard control,
 // visibility timeout extension, graceful shutdown, and observability.
 //
 // # Quick Start
 //
-//	rt := relay.New(sqsClient, relay.Config{
+//	rt := relay.New[SendEmail](sqsClient, relay.Config{
 //	    QueueURL:    queueURL,
 //	    Concurrency: 8,
-//	})
-//
-//	relay.Handle(rt, "send_email", func(ctx context.Context, msg relay.Message[SendEmail]) error {
+//	}, func(ctx context.Context, msg relay.Message[SendEmail]) error {
 //	    if err := emailService.Send(ctx, msg.Payload.UserID); err != nil {
 //	        if errors.Is(err, domain.ErrInvalidUser) {
 //	            return relay.Discard(err)
@@ -35,5 +33,6 @@
 // # Design Philosophy
 //
 // relay is SQS-specific (no multi-broker abstraction), thin (minimal API surface),
-// and assumes at-least-once delivery. Handlers should be idempotent.
+// and follows the "1 queue = 1 job type" best practice.
+// Handlers should be idempotent (at-least-once delivery).
 package relay

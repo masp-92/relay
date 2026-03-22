@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -70,17 +71,8 @@ func (m *mockSQSClient) ChangeMessageVisibility(ctx context.Context, params *sqs
 
 func ptr(s string) *string { return &s }
 
-func makeSQSMessage(msgID, receiptHandle, msgType string, payload any) sqstypes.Message {
-	p, _ := json.Marshal(payload)
-	env := Envelope{
-		Type:    msgType,
-		Payload: p,
-		Meta: EnvelopeMeta{
-			CorrelationID: "test-corr",
-			EnqueuedAt:    time.Now(),
-		},
-	}
-	body, _ := json.Marshal(env)
+func makeSQSMessage(msgID, receiptHandle string, payload any) sqstypes.Message {
+	body, _ := json.Marshal(payload)
 	return sqstypes.Message{
 		MessageId:     ptr(msgID),
 		ReceiptHandle: ptr(receiptHandle),
@@ -100,25 +92,20 @@ func TestHandleSuccess(t *testing.T) {
 
 	mock := &mockSQSClient{
 		messages: []sqstypes.Message{
-			makeSQSMessage("msg-1", "rh-1", "test_job", TestPayload{UserID: 42}),
+			makeSQSMessage("msg-1", "rh-1", TestPayload{UserID: 42}),
 		},
 	}
 
-	rt := New(mock, Config{
+	var called atomic.Bool
+	rt := New[TestPayload](mock, Config{
 		QueueURL:    "https://sqs.example.com/test",
 		Concurrency: 1,
-	})
-
-	var called atomic.Bool
-	Handle(rt, "test_job", func(ctx context.Context, msg Message[TestPayload]) error {
+	}, func(ctx context.Context, msg Message[TestPayload]) error {
 		if msg.Payload.UserID != 42 {
 			t.Errorf("UserID = %d, want 42", msg.Payload.UserID)
 		}
 		if msg.ID != "msg-1" {
 			t.Errorf("ID = %q, want %q", msg.ID, "msg-1")
-		}
-		if msg.Type != "test_job" {
-			t.Errorf("Type = %q, want %q", msg.Type, "test_job")
 		}
 		called.Store(true)
 		return nil
@@ -145,16 +132,14 @@ func TestHandleRetry(t *testing.T) {
 
 	mock := &mockSQSClient{
 		messages: []sqstypes.Message{
-			makeSQSMessage("msg-1", "rh-1", "retry_job", P{}),
+			makeSQSMessage("msg-1", "rh-1", P{}),
 		},
 	}
 
-	rt := New(mock, Config{
+	rt := New[P](mock, Config{
 		QueueURL:    "https://sqs.example.com/test",
 		Concurrency: 1,
-	})
-
-	Handle(rt, "retry_job", func(ctx context.Context, msg Message[P]) error {
+	}, func(ctx context.Context, msg Message[P]) error {
 		return Retry(errors.New("transient"))
 	})
 
@@ -174,16 +159,14 @@ func TestHandleDiscard(t *testing.T) {
 
 	mock := &mockSQSClient{
 		messages: []sqstypes.Message{
-			makeSQSMessage("msg-1", "rh-1", "discard_job", P{}),
+			makeSQSMessage("msg-1", "rh-1", P{}),
 		},
 	}
 
-	rt := New(mock, Config{
+	rt := New[P](mock, Config{
 		QueueURL:    "https://sqs.example.com/test",
 		Concurrency: 1,
-	})
-
-	Handle(rt, "discard_job", func(ctx context.Context, msg Message[P]) error {
+	}, func(ctx context.Context, msg Message[P]) error {
 		return Discard(errors.New("bad data"))
 	})
 
@@ -203,16 +186,14 @@ func TestHandlePlainErrorIsRetry(t *testing.T) {
 
 	mock := &mockSQSClient{
 		messages: []sqstypes.Message{
-			makeSQSMessage("msg-1", "rh-1", "err_job", P{}),
+			makeSQSMessage("msg-1", "rh-1", P{}),
 		},
 	}
 
-	rt := New(mock, Config{
+	rt := New[P](mock, Config{
 		QueueURL:    "https://sqs.example.com/test",
 		Concurrency: 1,
-	})
-
-	Handle(rt, "err_job", func(ctx context.Context, msg Message[P]) error {
+	}, func(ctx context.Context, msg Message[P]) error {
 		return errors.New("something went wrong")
 	})
 
@@ -228,52 +209,26 @@ func TestHandlePlainErrorIsRetry(t *testing.T) {
 	}
 }
 
-func TestUnknownTypeIsDiscarded(t *testing.T) {
-	mock := &mockSQSClient{
-		messages: []sqstypes.Message{
-			makeSQSMessage("msg-1", "rh-1", "unknown_type", map[string]any{"x": 1}),
-		},
-	}
-
-	rt := New(mock, Config{
-		QueueURL:    "https://sqs.example.com/test",
-		Concurrency: 1,
-	})
-	// No handlers registered for "unknown_type"
-
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	_ = rt.Run(ctx)
-
-	mock.mu.Lock()
-	defer mock.mu.Unlock()
-	if len(mock.deleted) != 1 {
-		t.Errorf("unknown type should be discarded (deleted), deleted = %v", mock.deleted)
-	}
-}
-
 func TestPanicRecoveryIsRetry(t *testing.T) {
 	type P struct{}
 
 	mock := &mockSQSClient{
 		messages: []sqstypes.Message{
-			makeSQSMessage("msg-1", "rh-1", "panic_job", P{}),
+			makeSQSMessage("msg-1", "rh-1", P{}),
 		},
 	}
 
 	var panicHookCalled atomic.Bool
-	rt := New(mock, Config{
+	rt := New[P](mock, Config{
 		QueueURL:    "https://sqs.example.com/test",
 		Concurrency: 1,
+	}, func(ctx context.Context, msg Message[P]) error {
+		panic("oh no")
 	}, WithHooks(Hooks{
 		OnPanic: func(ctx context.Context, info MessageInfo, recovered any) {
 			panicHookCalled.Store(true)
 		},
 	}))
-
-	Handle(rt, "panic_job", func(ctx context.Context, msg Message[P]) error {
-		panic("oh no")
-	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -302,10 +257,10 @@ func TestDecodeFailureIsDiscarded(t *testing.T) {
 		},
 	}
 
-	rt := New(mock, Config{
+	rt := New[struct{}](mock, Config{
 		QueueURL:    "https://sqs.example.com/test",
 		Concurrency: 1,
-	})
+	}, func(ctx context.Context, msg Message[struct{}]) error { return nil })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -318,22 +273,45 @@ func TestDecodeFailureIsDiscarded(t *testing.T) {
 	}
 }
 
-func TestDuplicateHandlerPanics(t *testing.T) {
-	type P struct{}
+func TestWithDecoder(t *testing.T) {
+	type P struct{ Value string }
 
-	rt := New(&mockSQSClient{}, Config{QueueURL: "https://sqs.example.com/test"})
-	Handle(rt, "dup", func(ctx context.Context, msg Message[P]) error { return nil })
+	mock := &mockSQSClient{
+		messages: []sqstypes.Message{
+			{
+				MessageId:     ptr("msg-1"),
+				ReceiptHandle: ptr("rh-1"),
+				Body:          ptr("custom:hello"),
+				Attributes:    map[string]string{"ApproximateReceiveCount": "1"},
+			},
+		},
+	}
 
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic on duplicate handler registration")
+	var called atomic.Bool
+	rt := New[P](mock, Config{
+		QueueURL:    "https://sqs.example.com/test",
+		Concurrency: 1,
+	}, func(ctx context.Context, msg Message[P]) error {
+		if msg.Payload.Value != "hello" {
+			t.Errorf("Value = %q, want hello", msg.Payload.Value)
 		}
-	}()
-	Handle(rt, "dup", func(ctx context.Context, msg Message[P]) error { return nil })
+		called.Store(true)
+		return nil
+	}, WithDecoder(func(body string) (P, error) {
+		return P{Value: strings.TrimPrefix(body, "custom:")}, nil
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_ = rt.Run(ctx)
+
+	if !called.Load() {
+		t.Error("handler was not called")
+	}
 }
 
 func TestMissingQueueURLReturnsError(t *testing.T) {
-	rt := New(&mockSQSClient{}, Config{})
+	rt := New[struct{}](&mockSQSClient{}, Config{}, func(ctx context.Context, msg Message[struct{}]) error { return nil })
 	err := rt.Run(context.Background())
 	if err == nil {
 		t.Error("expected error for missing QueueURL")
@@ -350,24 +328,21 @@ func TestConcurrentHandlers(t *testing.T) {
 		msgs = append(msgs, makeSQSMessage(
 			"msg-"+string(rune('0'+i)),
 			"rh-"+string(rune('0'+i)),
-			"concurrent_job",
 			P{N: i},
 		))
 	}
 
 	mock := &mockSQSClient{messages: msgs}
 
-	rt := New(mock, Config{
-		QueueURL:            "https://sqs.example.com/test",
-		Concurrency:         3,
-		MaxNumberOfMessages: 5,
-	})
-
 	var count atomic.Int32
 	var maxConcurrent atomic.Int32
 	var current atomic.Int32
 
-	Handle(rt, "concurrent_job", func(ctx context.Context, msg Message[P]) error {
+	rt := New[P](mock, Config{
+		QueueURL:            "https://sqs.example.com/test",
+		Concurrency:         3,
+		MaxNumberOfMessages: 5,
+	}, func(ctx context.Context, msg Message[P]) error {
 		c := current.Add(1)
 		count.Add(1)
 		for {
@@ -398,7 +373,7 @@ func TestHooksCalledInOrder(t *testing.T) {
 
 	mock := &mockSQSClient{
 		messages: []sqstypes.Message{
-			makeSQSMessage("msg-1", "rh-1", "hook_job", P{}),
+			makeSQSMessage("msg-1", "rh-1", P{}),
 		},
 	}
 
@@ -410,9 +385,12 @@ func TestHooksCalledInOrder(t *testing.T) {
 		order = append(order, s)
 	}
 
-	rt := New(mock, Config{
+	rt := New[P](mock, Config{
 		QueueURL:    "https://sqs.example.com/test",
 		Concurrency: 1,
+	}, func(ctx context.Context, msg Message[P]) error {
+		appendOrder("handler")
+		return nil
 	}, WithHooks(Hooks{
 		OnReceive: func(ctx context.Context, msg RawMessage) {
 			appendOrder("receive")
@@ -424,11 +402,6 @@ func TestHooksCalledInOrder(t *testing.T) {
 			appendOrder("finish")
 		},
 	}))
-
-	Handle(rt, "hook_job", func(ctx context.Context, msg Message[P]) error {
-		appendOrder("handler")
-		return nil
-	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()

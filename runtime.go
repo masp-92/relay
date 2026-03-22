@@ -21,20 +21,16 @@ import (
 
 const tracerName = "github.com/masp-92/relay"
 
-// handlerEntry is a type-erased handler stored in the registry.
-type handlerEntry struct {
-	fn func(ctx context.Context, msgID string, env *Envelope, meta Metadata) error
-}
-
 // Runtime is the relay worker runtime.
-// It polls SQS, decodes messages, dispatches to typed handlers,
+// It polls SQS, decodes messages, dispatches to a typed handler,
 // and manages lifecycle concerns (retry, discard, lease, shutdown).
-type Runtime struct {
-	client   SQSClient
-	config   Config
-	opts     options
-	handlers map[string]handlerEntry
-	sealed   atomic.Bool
+type Runtime[T any] struct {
+	client  SQSClient
+	config  Config
+	opts    options
+	handler HandlerFunc[T]
+	decoder Decoder[T]
+	sealed  atomic.Bool
 
 	// in-flight tracking
 	mu       sync.Mutex
@@ -52,9 +48,9 @@ type inflightMsg struct {
 	cancelLease   context.CancelFunc
 }
 
-// New creates a new Runtime. It does not start polling.
+// New creates a new Runtime with a typed handler. It does not start polling.
 // The client must implement the SQSClient interface (e.g., sqs.Client from AWS SDK v2).
-func New(client SQSClient, cfg Config, opts ...Option) *Runtime {
+func New[T any](client SQSClient, cfg Config, handler HandlerFunc[T], opts ...Option) *Runtime[T] {
 	cfg.setDefaults()
 
 	o := options{}
@@ -68,11 +64,22 @@ func New(client SQSClient, cfg Config, opts ...Option) *Runtime {
 		o.tracerProvider = otel.GetTracerProvider()
 	}
 
-	return &Runtime{
+	var decoder Decoder[T]
+	if o.decoder != nil {
+		decoder = o.decoder.(Decoder[T])
+	} else {
+		decoder = func(body string) (T, error) {
+			var v T
+			return v, json.Unmarshal([]byte(body), &v)
+		}
+	}
+
+	return &Runtime[T]{
 		client:   client,
 		config:   cfg,
 		opts:     o,
-		handlers: make(map[string]handlerEntry),
+		handler:  handler,
+		decoder:  decoder,
 		inflight: make(map[string]*inflightMsg),
 		sem:      make(chan struct{}, cfg.Concurrency),
 		logger:   o.logger.With("component", "relay"),
@@ -80,47 +87,16 @@ func New(client SQSClient, cfg Config, opts ...Option) *Runtime {
 	}
 }
 
-// Handle registers a typed handler for the given message type.
-// T is the payload type that will be JSON-decoded from the envelope.
-//
-// Handle panics if:
-//   - messageType is already registered (programming error)
-//   - called after Run has started
-//
-// This is a package-level generic function because Go does not support
-// generic methods on concrete types.
-func Handle[T any](rt *Runtime, messageType string, fn func(context.Context, Message[T]) error) {
-	if rt.sealed.Load() {
-		panic(fmt.Sprintf("relay: Handle called after Run for type %q", messageType))
-	}
-	if _, exists := rt.handlers[messageType]; exists {
-		panic(fmt.Sprintf("relay: duplicate handler for type %q", messageType))
-	}
-
-	rt.handlers[messageType] = handlerEntry{
-		fn: func(ctx context.Context, msgID string, env *Envelope, meta Metadata) error {
-			var payload T
-			if err := json.Unmarshal(env.Payload, &payload); err != nil {
-				return fmt.Errorf("relay: unmarshal payload for type %q: %w", messageType, err)
-			}
-			msg := Message[T]{
-				ID:       msgID,
-				Type:     messageType,
-				Payload:  payload,
-				Metadata: meta,
-			}
-			return fn(ctx, msg)
-		},
-	}
-}
-
 // Run starts the polling loop and blocks until ctx is cancelled or a fatal error occurs.
 // After ctx cancellation, it performs graceful shutdown.
-func (rt *Runtime) Run(ctx context.Context) error {
+// Run must be called at most once per Runtime.
+func (rt *Runtime[T]) Run(ctx context.Context) error {
+	if rt.sealed.Swap(true) {
+		return fmt.Errorf("relay: Run called more than once")
+	}
 	if err := rt.config.validate(); err != nil {
 		return err
 	}
-	rt.sealed.Store(true)
 
 	rt.logger.InfoContext(ctx, "relay runtime starting",
 		"queue_url", rt.config.QueueURL,
@@ -151,7 +127,7 @@ func (rt *Runtime) Run(ctx context.Context) error {
 	return nil
 }
 
-func (rt *Runtime) pollLoop(ctx context.Context) {
+func (rt *Runtime[T]) pollLoop(ctx context.Context) {
 	var consecutiveErrors int
 
 	for {
@@ -196,7 +172,7 @@ func (rt *Runtime) pollLoop(ctx context.Context) {
 	}
 }
 
-func (rt *Runtime) receive(ctx context.Context) ([]sqstypes.Message, error) {
+func (rt *Runtime[T]) receive(ctx context.Context) ([]sqstypes.Message, error) {
 	input := &sqs.ReceiveMessageInput{
 		QueueUrl:            &rt.config.QueueURL,
 		WaitTimeSeconds:     rt.config.WaitTimeSeconds,
@@ -217,7 +193,7 @@ func (rt *Runtime) receive(ctx context.Context) ([]sqstypes.Message, error) {
 	return output.Messages, nil
 }
 
-func (rt *Runtime) processMessage(ctx context.Context, sqsMsg sqstypes.Message) {
+func (rt *Runtime[T]) processMessage(ctx context.Context, sqsMsg sqstypes.Message) {
 	msgID := derefStr(sqsMsg.MessageId)
 	receiptHandle := derefStr(sqsMsg.ReceiptHandle)
 	body := derefStr(sqsMsg.Body)
@@ -233,33 +209,13 @@ func (rt *Runtime) processMessage(ctx context.Context, sqsMsg sqstypes.Message) 
 
 	rt.logger.DebugContext(ctx, "relay: message received", "message_id", msgID)
 
-	// Decode envelope
-	var env Envelope
-	if err := json.Unmarshal([]byte(body), &env); err != nil {
-		rt.logger.ErrorContext(ctx, "relay: envelope decode failure",
+	// Decode body into T using the configured decoder
+	payload, err := rt.decoder(body)
+	if err != nil {
+		rt.logger.ErrorContext(ctx, "relay: message decode failure",
 			"message_id", msgID,
 			"error", err,
 		)
-		rt.deleteMessage(ctx, receiptHandle, msgID)
-		return
-	}
-
-	if env.Type == "" {
-		rt.logger.ErrorContext(ctx, "relay: envelope missing type field",
-			"message_id", msgID,
-		)
-		rt.deleteMessage(ctx, receiptHandle, msgID)
-		return
-	}
-
-	// Lookup handler
-	entry, ok := rt.handlers[env.Type]
-	if !ok {
-		rt.logger.ErrorContext(ctx, "relay: unknown message type",
-			"message_id", msgID,
-			"message_type", env.Type,
-		)
-		// Discard: delete to prevent poison message loop
 		rt.deleteMessage(ctx, receiptHandle, msgID)
 		return
 	}
@@ -268,8 +224,6 @@ func (rt *Runtime) processMessage(ctx context.Context, sqsMsg sqstypes.Message) 
 	attempt := parseAttempt(sqsMsg.Attributes)
 	meta := Metadata{
 		Attempt:       attempt,
-		EnqueuedAt:    env.Meta.EnqueuedAt,
-		CorrelationID: env.Meta.CorrelationID,
 		ReceiptHandle: receiptHandle,
 	}
 	if gid, ok := sqsMsg.Attributes["MessageGroupId"]; ok {
@@ -279,11 +233,15 @@ func (rt *Runtime) processMessage(ctx context.Context, sqsMsg sqstypes.Message) 
 		meta.MessageDedupID = did
 	}
 
+	msg := Message[T]{
+		ID:       msgID,
+		Payload:  payload,
+		Metadata: meta,
+	}
+
 	info := MessageInfo{
 		ID:            msgID,
-		Type:          env.Type,
 		Attempt:       attempt,
-		CorrelationID: env.Meta.CorrelationID,
 		ReceiptHandle: receiptHandle,
 	}
 
@@ -294,16 +252,15 @@ func (rt *Runtime) processMessage(ctx context.Context, sqsMsg sqstypes.Message) 
 			attribute.String("messaging.destination", rt.config.QueueURL),
 			attribute.String("messaging.message.id", msgID),
 			attribute.String("messaging.operation", "process"),
-			attribute.String("relay.message.type", env.Type),
 			attribute.Int("relay.attempt", attempt),
 		),
 	)
 	defer span.End()
 
 	// Register in-flight (for lease extension)
-	var leaseCtx context.Context
 	var leaseCancel context.CancelFunc
 	if rt.config.LeaseExtensionInterval > 0 {
+		var leaseCtx context.Context
 		leaseCtx, leaseCancel = context.WithCancel(context.Background())
 		rt.registerInflight(msgID, receiptHandle, leaseCancel)
 		go rt.extendLease(leaseCtx, msgID, receiptHandle, info)
@@ -315,7 +272,7 @@ func (rt *Runtime) processMessage(ctx context.Context, sqsMsg sqstypes.Message) 
 	}
 
 	// Execute handler with panic recovery
-	handlerErr := rt.executeHandler(spanCtx, entry, msgID, &env, meta, info)
+	handlerErr := rt.executeHandler(spanCtx, msg, info)
 
 	// Stop lease extension
 	if leaseCancel != nil {
@@ -331,19 +288,15 @@ func (rt *Runtime) processMessage(ctx context.Context, sqsMsg sqstypes.Message) 
 	// Determine outcome
 	switch {
 	case handlerErr == nil:
-		// Success: delete message
 		rt.logger.InfoContext(spanCtx, "relay: handler success",
 			"message_id", msgID,
-			"message_type", env.Type,
 		)
 		span.SetStatus(codes.Ok, "")
 		rt.deleteMessage(spanCtx, receiptHandle, msgID)
 
 	case IsDiscard(handlerErr):
-		// Discard: delete message, record discard
 		rt.logger.WarnContext(spanCtx, "relay: handler discard",
 			"message_id", msgID,
-			"message_type", env.Type,
 			"error", handlerErr,
 		)
 		span.SetStatus(codes.Ok, "discarded")
@@ -351,10 +304,8 @@ func (rt *Runtime) processMessage(ctx context.Context, sqsMsg sqstypes.Message) 
 		rt.deleteMessage(spanCtx, receiptHandle, msgID)
 
 	default:
-		// Retry (explicit or implicit): do NOT delete
 		rt.logger.WarnContext(spanCtx, "relay: handler retry",
 			"message_id", msgID,
-			"message_type", env.Type,
 			"error", handlerErr,
 		)
 		span.RecordError(handlerErr)
@@ -363,13 +314,12 @@ func (rt *Runtime) processMessage(ctx context.Context, sqsMsg sqstypes.Message) 
 	}
 }
 
-func (rt *Runtime) executeHandler(ctx context.Context, entry handlerEntry, msgID string, env *Envelope, meta Metadata, info MessageInfo) (handlerErr error) {
+func (rt *Runtime[T]) executeHandler(ctx context.Context, msg Message[T], info MessageInfo) (handlerErr error) {
 	defer func() {
 		if r := recover(); r != nil {
 			handlerErr = fmt.Errorf("relay: handler panicked: %v", r)
 			rt.logger.ErrorContext(ctx, "relay: panic recovered",
 				"message_id", info.ID,
-				"message_type", info.Type,
 				"recovered", r,
 			)
 			if rt.opts.hooks.OnPanic != nil {
@@ -379,10 +329,10 @@ func (rt *Runtime) executeHandler(ctx context.Context, entry handlerEntry, msgID
 		}
 	}()
 
-	return entry.fn(ctx, msgID, env, meta)
+	return rt.handler(ctx, msg)
 }
 
-func (rt *Runtime) extendLease(ctx context.Context, msgID, receiptHandle string, info MessageInfo) {
+func (rt *Runtime[T]) extendLease(ctx context.Context, msgID, receiptHandle string, info MessageInfo) {
 	ticker := time.NewTicker(rt.config.LeaseExtensionInterval)
 	defer ticker.Stop()
 
@@ -393,7 +343,6 @@ func (rt *Runtime) extendLease(ctx context.Context, msgID, receiptHandle string,
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Check max processing time
 			if rt.config.MaxProcessingTime > 0 && time.Since(startedAt) > rt.config.MaxProcessingTime {
 				rt.logger.WarnContext(ctx, "relay: max processing time exceeded, stopping lease extension",
 					"message_id", msgID,
@@ -421,7 +370,7 @@ func (rt *Runtime) extendLease(ctx context.Context, msgID, receiptHandle string,
 	}
 }
 
-func (rt *Runtime) registerInflight(msgID, receiptHandle string, cancel context.CancelFunc) {
+func (rt *Runtime[T]) registerInflight(msgID, receiptHandle string, cancel context.CancelFunc) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.inflight[msgID] = &inflightMsg{
@@ -431,13 +380,13 @@ func (rt *Runtime) registerInflight(msgID, receiptHandle string, cancel context.
 	}
 }
 
-func (rt *Runtime) unregisterInflight(msgID string) {
+func (rt *Runtime[T]) unregisterInflight(msgID string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	delete(rt.inflight, msgID)
 }
 
-func (rt *Runtime) deleteMessage(ctx context.Context, receiptHandle, msgID string) {
+func (rt *Runtime[T]) deleteMessage(ctx context.Context, receiptHandle, msgID string) {
 	_, err := rt.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
 		QueueUrl:      &rt.config.QueueURL,
 		ReceiptHandle: &receiptHandle,
@@ -450,7 +399,7 @@ func (rt *Runtime) deleteMessage(ctx context.Context, receiptHandle, msgID strin
 	}
 }
 
-func (rt *Runtime) backoff(ctx context.Context, consecutiveErrors int) {
+func (rt *Runtime[T]) backoff(ctx context.Context, consecutiveErrors int) {
 	delay := time.Duration(math.Min(
 		float64(time.Second)*math.Pow(2, float64(consecutiveErrors-1)),
 		float64(30*time.Second),

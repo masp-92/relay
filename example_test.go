@@ -23,15 +23,12 @@ func Example() {
 	sqsClient := sqs.New(sqs.Options{})
 	queueURL := "https://sqs.ap-northeast-1.amazonaws.com/123456789012/my-queue"
 
-	rt := relay.New(sqsClient, relay.Config{
+	rt := relay.New[SendEmail](sqsClient, relay.Config{
 		QueueURL:                 queueURL,
 		Concurrency:              8,
 		MaxNumberOfMessages:      8,
 		VisibilityTimeoutSeconds: 60,
-	})
-
-	relay.Handle(rt, "send_email", func(ctx context.Context, msg relay.Message[SendEmail]) error {
-		// Your business logic here
+	}, func(ctx context.Context, msg relay.Message[SendEmail]) error {
 		err := processSendEmail(ctx, msg.Payload)
 		if err != nil {
 			if errors.Is(err, errInvalidUser) {
